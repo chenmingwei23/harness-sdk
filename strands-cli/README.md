@@ -425,7 +425,8 @@ This approval layer is not an operating-system sandbox. Unless a caller supplies
 `sandbox`, the harness's shell, file, MCP, delegate, and Background Task work runs in the host process with
 the user's permissions. Plain, print, and ACP server modes have no permission UI and therefore use
 stock harness tool behavior; library consumers can pass their own `interventions` and `sandbox` options
-to `createHarness()`.
+to `createHarness()`. In ACP server mode, an `--interventions` policy that asks for approval sends the
+client a `session/request_permission` request for each gated call and runs or denies the call by the answer.
 
 An Ink `!<command>` shell escape is an explicit user action, so it does not pass through the agent's
 tool-approval intervention. It executes through the same `agent.sandbox` used by the harness's tools and

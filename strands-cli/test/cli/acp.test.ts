@@ -1041,6 +1041,122 @@ async function writeSavedSession(sessionDirectory: string, sessionId: string): P
   await writeFile(join(snapshots, 'snapshot_latest.json'), '{"data":{"messages":[]}}')
 }
 
+describe('ACP tool permissions', () => {
+  class ToolCallingModel extends Model {
+    private config = { modelId: 'permission-test', contextWindowLimit: 10_000 }
+
+    updateConfig(config: { modelId?: string; contextWindowLimit?: number }): void {
+      this.config = { ...this.config, ...config }
+    }
+
+    getConfig(): { modelId: string; contextWindowLimit: number } {
+      return this.config
+    }
+
+    async *stream(messages: readonly Message[]): AsyncIterable<ModelStreamEvent> {
+      const last = messages.at(-1)?.content[0]
+      yield { type: 'modelMessageStartEvent', role: 'assistant' }
+      if (last?.type === 'textBlock' && last.text === 'use the tool') {
+        yield {
+          type: 'modelContentBlockStartEvent',
+          start: { type: 'toolUseStart', name: 'probe', toolUseId: 'probe-call' },
+        }
+        yield { type: 'modelContentBlockDeltaEvent', delta: { type: 'toolUseInputDelta', input: '{"value":1}' } }
+        yield { type: 'modelContentBlockStopEvent' }
+        yield { type: 'modelMessageStopEvent', stopReason: 'toolUse' }
+        return
+      }
+      yield { type: 'modelContentBlockStartEvent' }
+      yield { type: 'modelContentBlockDeltaEvent', delta: { type: 'textDelta', text: 'done' } }
+      yield { type: 'modelContentBlockStopEvent' }
+      yield { type: 'modelMessageStopEvent', stopReason: 'endTurn' }
+    }
+  }
+
+  async function connect(answer: (request: acp.RequestPermissionRequest) => Promise<acp.RequestPermissionResponse>) {
+    const ran = vi.fn(() => 'PROBE_RESULT')
+    const service = new AcpService({
+      model: new ToolCallingModel(),
+      session: false,
+      memory: false,
+      builtinTools: [],
+      contextManager: false,
+      interventions: 'ask',
+      tools: [new FunctionTool({ name: 'probe', description: 'Record that it ran.', callback: ran })],
+    })
+    const requests: acp.RequestPermissionRequest[] = []
+    const updates: acp.SessionUpdate[] = []
+    const connection = acp
+      .client({ name: 'permission-test' })
+      .onNotification(acp.methods.client.session.update, (context) => {
+        updates.push(context.params.update)
+      })
+      .onRequest(acp.methods.client.session.requestPermission, (context) => {
+        requests.push(context.params)
+        return answer(context.params)
+      })
+      .connect(createAcpApp(service))
+    const { sessionId } = await connection.agent.request(acp.methods.agent.session.new, {
+      cwd: process.cwd(),
+      mcpServers: [],
+    })
+    const prompt = (text: string) =>
+      connection.agent.request(acp.methods.agent.session.prompt, { sessionId, prompt: [{ type: 'text', text }] })
+    const close = async () => {
+      connection.close()
+      await connection.closed
+      await service.dispose()
+    }
+    return { connection, sessionId, prompt, ran, requests, updates, close }
+  }
+
+  it.each([
+    ['allow', true, 'completed'],
+    ['deny', false, 'failed'],
+  ] as const)('asks the client before a gated tool call and applies %s', async (optionId, runs, status) => {
+    const acpClient = await connect(async () => ({ outcome: { outcome: 'selected', optionId } }))
+    try {
+      expect(await acpClient.prompt('use the tool')).toMatchObject({ stopReason: 'end_turn' })
+      expect(acpClient.requests).toEqual([
+        expect.objectContaining({
+          sessionId: acpClient.sessionId,
+          toolCall: expect.objectContaining({
+            toolCallId: 'probe-call',
+            title: 'probe',
+            status: 'pending',
+            rawInput: { value: 1 },
+          }),
+          options: [
+            { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+            { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+          ],
+        }),
+      ])
+      expect(acpClient.ran).toHaveBeenCalledTimes(runs ? 1 : 0)
+      expect(acpClient.updates).toContainEqual(
+        expect.objectContaining({ sessionUpdate: 'tool_call_update', toolCallId: 'probe-call', status })
+      )
+    } finally {
+      await acpClient.close()
+    }
+  })
+
+  it('denies the call and ends the turn as cancelled when the prompt is cancelled during a request', async () => {
+    let acpClient: Awaited<ReturnType<typeof connect>> | undefined
+    acpClient = await connect(async () => {
+      await acpClient!.connection.agent.notify(acp.methods.agent.session.cancel, { sessionId: acpClient!.sessionId })
+      return { outcome: { outcome: 'cancelled' } }
+    })
+    try {
+      expect(await acpClient.prompt('use the tool')).toMatchObject({ stopReason: 'cancelled' })
+      expect(acpClient.ran).not.toHaveBeenCalled()
+      expect(await acpClient.prompt('hello')).toMatchObject({ stopReason: 'end_turn' })
+    } finally {
+      await acpClient.close()
+    }
+  })
+})
+
 describe('Python ACP session lifetime', () => {
   it.each(['duplicate', 'replay failure', 'connection closure'])('cleans up after %s', async (scenario) => {
     const closed = deferred()

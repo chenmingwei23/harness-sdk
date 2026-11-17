@@ -1,6 +1,15 @@
 import * as acp from '@agentclientprotocol/sdk'
 import { createHarness, type HarnessAgentOptions } from '@strands-agents/harness'
-import { McpClient, type Agent, type McpServerConfig, type Usage } from '@strands-agents/sdk'
+import {
+  McpClient,
+  type Agent,
+  type AgentResult,
+  type AgentStreamEvent,
+  type Interrupt,
+  type InterruptResponseContentData,
+  type McpServerConfig,
+  type Usage,
+} from '@strands-agents/sdk'
 import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { Readable, Writable } from 'node:stream'
@@ -36,8 +45,19 @@ interface AcpSession {
   agent: Agent
   mcpClients: readonly McpClient[]
   activePrompt?: Promise<void>
+  promptCancel?: AbortController
   background?: { publish: () => Promise<void>; dispose: () => void }
 }
+
+interface TurnState {
+  latestModelUsage?: Usage | undefined
+  toolCalls: Map<string, { name: string; input: unknown }>
+}
+
+const PERMISSION_OPTIONS: acp.PermissionOption[] = [
+  { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+  { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+]
 
 export class AcpService {
   private readonly _agentOptions: HarnessAgentOptions
@@ -144,35 +164,35 @@ export class AcpService {
     if (session.background && params.prompt.length === 0 && !hasReadyBackgroundResults(session.agent)) {
       return { stopReason: 'end_turn' }
     }
-    const stream = session.agent.stream(projectPrompt(params.prompt))
+    const promptCancel = new AbortController()
+    let stream = session.agent.stream(projectPrompt(params.prompt))
     let settlePrompt: () => void
     session.activePrompt = new Promise<void>((resolve) => {
       settlePrompt = resolve
     })
+    session.promptCancel = promptCancel
     try {
       const runUsage = RunUsage.start(session.agent)
-      let latestModelUsage: Usage | undefined
-      let next = await stream.next()
-      while (!next.done) {
-        // The SDK removes delivered tasks from state after these events.
-        if (next.value.type === 'beforeModelCallEvent' || next.value.type === 'afterInvocationEvent') {
-          await session.background?.publish()
-        }
-        latestModelUsage = latestRootModelUsage(session.agent, next.value) ?? latestModelUsage
-        for (const event of projectAgentEvent(next.value)) {
-          if (
-            session.background &&
-            event.type === 'toolResult' &&
-            readBackgroundTasks(session.agent).some((task) => task.toolUseId === event.toolUseId)
-          ) {
-            await session.background.publish()
-            continue
-          }
-          await sendChatEvent(client, params.sessionId, event)
-        }
-        next = await stream.next()
+      const turn: TurnState = { toolCalls: new Map() }
+      let agentResult = await this._forwardStream(session, stream, client, params.sessionId, turn)
+      // An intervention that asks a human pauses the agent with an interrupt per tool call; the client
+      // answers each one through session/request_permission and the agent resumes with the answers.
+      while (agentResult.stopReason === 'interrupt' && agentResult.interrupts?.length) {
+        const responses = await requestPermissions(
+          client,
+          params.sessionId,
+          agentResult.interrupts,
+          turn.toolCalls,
+          promptCancel.signal
+        )
+        stream = session.agent.stream(responses)
+        agentResult = await this._forwardStream(session, stream, client, params.sessionId, turn, {
+          // A cancel that arrived while the client was deciding still lets the denied calls record their
+          // results, so the agent leaves the interrupted state and the next prompt starts cleanly.
+          stopAfterTools: promptCancel.signal.aborted,
+        })
       }
-      const result = projectAgentResult(session.agent, next.value, latestModelUsage, runUsage.total())
+      const result = projectAgentResult(session.agent, agentResult, turn.latestModelUsage, runUsage.total())
       const used = result.context?.projectedTokens ?? result.context?.currentTokens
       if (used !== undefined && result.context?.contextWindow !== undefined) {
         await client.notify(acp.methods.client.session.update, {
@@ -196,11 +216,14 @@ export class AcpService {
     } finally {
       settlePrompt!()
       delete session.activePrompt
+      delete session.promptCancel
     }
   }
 
   cancel(sessionId: string): void {
-    this._sessions.get(sessionId)?.agent.cancel()
+    const session = this._sessions.get(sessionId)
+    session?.promptCancel?.abort()
+    session?.agent.cancel()
   }
 
   async dispose(): Promise<void> {
@@ -254,6 +277,39 @@ export class AcpService {
     } finally {
       this._openingSessions.delete(sessionId)
     }
+  }
+
+  private async _forwardStream(
+    session: AcpSession,
+    stream: AsyncGenerator<AgentStreamEvent, AgentResult>,
+    client: acp.AgentContext,
+    sessionId: string,
+    turn: TurnState,
+    options: { stopAfterTools?: boolean } = {}
+  ): Promise<AgentResult> {
+    let next = await stream.next()
+    if (options.stopAfterTools) session.agent.cancel({ afterCurrentTools: true })
+    while (!next.done) {
+      // The SDK removes delivered tasks from state after these events.
+      if (next.value.type === 'beforeModelCallEvent' || next.value.type === 'afterInvocationEvent') {
+        await session.background?.publish()
+      }
+      turn.latestModelUsage = latestRootModelUsage(session.agent, next.value) ?? turn.latestModelUsage
+      for (const event of projectAgentEvent(next.value)) {
+        if (event.type === 'toolStart') turn.toolCalls.set(event.toolUseId, { name: event.name, input: event.input })
+        if (
+          session.background &&
+          event.type === 'toolResult' &&
+          readBackgroundTasks(session.agent).some((task) => task.toolUseId === event.toolUseId)
+        ) {
+          await session.background.publish()
+          continue
+        }
+        await sendChatEvent(client, sessionId, event)
+      }
+      next = await stream.next()
+    }
+    return next.value
   }
 
   private _watchBackgroundTasks(sessionId: string, session: AcpSession, client: acp.AgentContext): void {
@@ -392,6 +448,46 @@ async function loadAcpMcpClients(servers: readonly acp.McpServer[]): Promise<Mcp
     }
   }
   return McpClient.loadServers(definitions, { applicationVersion: HARNESS_VERSION }, { prefixWithServerName: true })
+}
+
+async function requestPermissions(
+  client: acp.AgentContext,
+  sessionId: string,
+  interrupts: readonly Interrupt[],
+  toolCalls: TurnState['toolCalls'],
+  signal: AbortSignal
+): Promise<InterruptResponseContentData[]> {
+  const responses: InterruptResponseContentData[] = []
+  for (const interrupt of interrupts) {
+    const approved = !signal.aborted && (await requestPermission(client, sessionId, interrupt, toolCalls))
+    responses.push({ interruptResponse: { interruptId: interrupt.id, response: approved } })
+  }
+  return responses
+}
+
+async function requestPermission(
+  client: acp.AgentContext,
+  sessionId: string,
+  interrupt: Interrupt,
+  toolCalls: TurnState['toolCalls']
+): Promise<boolean> {
+  // Tool-call interrupts are keyed by the tool use they pause, so the request can point at the announced call.
+  const toolCallId = [...toolCalls.keys()].find((id) => interrupt.id.startsWith(`hook:beforeToolCall:${id}:`))
+  const toolCall = toolCallId === undefined ? undefined : toolCalls.get(toolCallId)
+  const result = await client.request(acp.methods.client.session.requestPermission, {
+    sessionId,
+    toolCall: {
+      toolCallId: toolCallId ?? interrupt.id,
+      title: toolCall?.name ?? interrupt.name,
+      status: 'pending',
+      ...(toolCall ? { rawInput: toolCall.input } : {}),
+      ...(typeof interrupt.reason === 'string'
+        ? { content: [{ type: 'content', content: { type: 'text', text: interrupt.reason } }] }
+        : {}),
+    },
+    options: PERMISSION_OPTIONS,
+  })
+  return result.outcome.outcome === 'selected' && result.outcome.optionId === 'allow'
 }
 
 async function disconnectMcpClients(clients: readonly McpClient[]): Promise<void> {
